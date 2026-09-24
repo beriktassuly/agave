@@ -7,6 +7,8 @@
 #![allow(clippy::unnecessary_cast)]
 #![allow(clippy::uninlined_format_args)]
 
+#[cfg(feature = "sbf_c")]
+use solana_account::state_traits::StateMutWincode as _;
 #[cfg(not(feature = "sbf_sanity_list"))]
 use solana_program_runtime::execution_budget::MAX_COMPUTE_UNIT_LIMIT;
 #[cfg(all(feature = "sbf_rust", feature = "sbpf-v3"))]
@@ -29,7 +31,8 @@ use {
     solana_fee_calculator::FeeRateGovernor,
     solana_fee_structure::{FeeBin, FeeStructure},
     solana_hash::Hash,
-    solana_instruction::{AccountMeta, Instruction, error::InstructionError},
+    solana_instruction::{AccountMeta, Instruction},
+    solana_instruction_error::InstructionError,
     solana_keypair::Keypair,
     solana_loader_v3_interface::{
         instruction as loader_v3_instruction, state::UpgradeableLoaderState,
@@ -125,6 +128,7 @@ fn upgradeable_program_accounts(program_id: &Pubkey, program_elf: &[u8]) -> Vec<
     solana_program_binaries::bpf_loader_upgradeable_program_accounts(
         program_id,
         program_elf,
+        &Pubkey::default(),
         &Rent::default(),
     )
     .into()

@@ -230,10 +230,7 @@ pub fn execute_txn_proto(context: &ProtoTxnContext) -> ProtoTxnResult {
         virtual_address_space_adjustments_active,
         cu_avail,
         has_err,
-        txn_result
-            .modified_accounts
-            .iter_mut()
-            .map(|acc| &mut acc.data),
+        txn_result.modified_accounts.iter_mut(),
     );
 
     txn_result
@@ -241,7 +238,7 @@ pub fn execute_txn_proto(context: &ProtoTxnContext) -> ProtoTxnResult {
 
 /// Parse the input accounts into keyed `AccountSharedData`, dropping zero-lamport
 /// accounts (treated as nonexistent).
-fn deserialize_accounts(accounts: &[AcctState]) -> Vec<(Pubkey, AccountSharedData)> {
+pub(crate) fn deserialize_accounts(accounts: &[AcctState]) -> Vec<(Pubkey, AccountSharedData)> {
     accounts
         .iter()
         .filter(|account| account.lamports > 0)
@@ -252,7 +249,7 @@ fn deserialize_accounts(accounts: &[AcctState]) -> Vec<(Pubkey, AccountSharedDat
         .collect()
 }
 
-fn restore_blockhash_queue(entries: &[ProtoBlockhashQueueEntry]) -> BlockhashQueue {
+pub(crate) fn restore_blockhash_queue(entries: &[ProtoBlockhashQueueEntry]) -> BlockhashQueue {
     let mut blockhash_queue = BlockhashQueue::default();
     for entry in entries {
         let blockhash =
@@ -262,7 +259,7 @@ fn restore_blockhash_queue(entries: &[ProtoBlockhashQueueEntry]) -> BlockhashQue
     blockhash_queue
 }
 
-fn fee_rate_governor_from_proto(
+pub(crate) fn fee_rate_governor_from_proto(
     value: &ProtoFeeRateGovernor,
     lamports_per_signature: u64,
 ) -> FeeRateGovernor {
@@ -286,7 +283,7 @@ fn new_accounts_db_config_for_tests_single_threaded() -> AccountsDbConfig {
     }
 }
 
-fn new_accounts_for_tests_single_threaded() -> Accounts {
+pub(crate) fn new_accounts_for_tests_single_threaded() -> Accounts {
     Accounts::new(Arc::new(AccountsDb::new_for_tests_with_config(
         Vec::new(),
         new_accounts_db_config_for_tests_single_threaded(),
@@ -426,9 +423,9 @@ mod tests {
             MessageAddressTableLookup as ProtoMessageAddressTableLookup,
             MessageHeader as ProtoMessageHeader, SanitizedTransaction as ProtoSanitizedTransaction,
             TransactionMessage as ProtoTransactionMessage, TxnBank as ProtoTxnBank,
-            TxnContext as ProtoTxnContext,
+            TxnContext as ProtoTxnContext, acct_state::DataRepr,
         },
-        solana_account::AccountSharedData,
+        solana_account::{AccountSharedData, ReadableAccount},
         solana_address_lookup_table_interface::state::{AddressLookupTable, LookupTableMeta},
         solana_clock::Clock,
         solana_epoch_schedule::EpochSchedule,
@@ -445,7 +442,7 @@ mod tests {
         solana_signature::Signature,
         solana_slot_hashes::SlotHashes,
         solana_svm::{
-            conformance::account_state::account_to_proto,
+            conformance::fd_hash::fd_hash_or_zero,
             transaction_processing_result::ProcessedTransaction,
         },
         solana_transaction::versioned::VersionedTransaction,
@@ -496,11 +493,10 @@ mod tests {
     fn proto_transaction(transaction: &VersionedTransaction) -> ProtoSanitizedTransaction {
         let message = &transaction.message;
         let header = message.header();
-        // The fixture format only distinguishes legacy from v0.
-        let (is_legacy, address_table_lookups) = match message {
-            VersionedMessage::Legacy(_) => (true, vec![]),
+        let (version, address_table_lookups) = match message {
+            VersionedMessage::Legacy(_) => (protosol::protos::TransactionVersion::Legacy, vec![]),
             VersionedMessage::V0(message) => (
-                false,
+                protosol::protos::TransactionVersion::V0,
                 message
                     .address_table_lookups
                     .iter()
@@ -526,7 +522,7 @@ mod tests {
 
         ProtoSanitizedTransaction {
             message: Some(ProtoTransactionMessage {
-                is_legacy,
+                version: version as i32,
                 header: Some(ProtoMessageHeader {
                     num_required_signatures: u32::from(header.num_required_signatures),
                     num_readonly_signed_accounts: u32::from(header.num_readonly_signed_accounts),
@@ -555,6 +551,7 @@ mod tests {
                     })
                     .collect(),
                 address_table_lookups,
+                v1_config: None,
             }),
             message_hash: vec![0; 32],
             signatures: transaction
@@ -574,7 +571,13 @@ mod tests {
             tx: Some(proto_transaction(&transaction)),
             account_shared_data: accounts
                 .into_iter()
-                .map(|(pubkey, account)| account_to_proto((pubkey, account.into())))
+                .map(|(pubkey, account)| protosol::protos::AcctState {
+                    address: pubkey.to_bytes().to_vec(),
+                    owner: account.owner().to_bytes().to_vec(),
+                    lamports: account.lamports(),
+                    data_repr: Some(DataRepr::Data(account.data().to_vec())),
+                    executable: account.executable(),
+                })
                 .collect(),
             bank: Some(ProtoTxnBank {
                 blockhash_queue,
@@ -781,7 +784,7 @@ mod tests {
         assert_eq!(fee_details.prioritization_fee, 0);
         assert!(result.modified_accounts.is_empty());
         assert!(result.rollback_accounts.is_empty());
-        assert!(result.return_data.is_empty());
+        assert_eq!(result.return_data_hash, 0);
     }
 
     #[test]
@@ -822,7 +825,10 @@ mod tests {
         let result = execute_txn_proto(&txn_context(accounts, transaction, blockhash_queue));
 
         assert_executed_ok(&result);
-        assert_eq!(result.return_data.len(), 8);
+        assert_eq!(
+            result.return_data_hash,
+            fd_hash_or_zero(&1720556855i64.to_be_bytes())
+        );
     }
 
     #[test]

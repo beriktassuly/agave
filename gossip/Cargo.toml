@@ -57,6 +57,7 @@ itertools = { workspace = true }
 lazy-lru = { workspace = true }
 log = { workspace = true }
 num-traits = { workspace = true }
+parking_lot = { workspace = true }
 qualifier_attr = { workspace = true, optional = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
@@ -101,6 +102,7 @@ criterion = { workspace = true }
 num_cpus = { workspace = true }
 serial_test = { workspace = true }
 solana-gossip = { path = ".", features = ["agave-unstable-api", "dev-context-only-utils"] }
+solana-ledger = { workspace = true, features = ["dev-context-only-utils"] }
 solana-net-utils = { path = "../net-utils", features = ["agave-unstable-api", "dev-context-only-utils"] }
 solana-perf = { path = "../perf", features = ["agave-unstable-api", "dev-context-only-utils"] }
 solana-runtime = { path = "../runtime", features = ["agave-unstable-api", "dev-context-only-utils"] }

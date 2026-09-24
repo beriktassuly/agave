@@ -1047,14 +1047,12 @@ impl AccountsDb {
         &self,
         pubkey: &Pubkey,
         max_clean_root_inclusive: Slot,
-    ) -> ReclaimsWithNewestSlot<AccountInfo> {
+        reclaims: &mut ReclaimsWithNewestSlot<AccountInfo>,
+    ) {
         let mut clean_rooted = Measure::start("clean_old_root-ms");
-        let mut reclaims = ReclaimsWithNewestSlot::new();
-        let removed_from_index = self.accounts_index.clean_rooted_entries(
-            pubkey,
-            &mut reclaims,
-            max_clean_root_inclusive,
-        );
+        let removed_from_index =
+            self.accounts_index
+                .clean_rooted_entries(pubkey, reclaims, max_clean_root_inclusive);
         clean_rooted.stop();
         if removed_from_index {
             self.clean_accounts_stats
@@ -1065,7 +1063,6 @@ impl AccountsDb {
         self.clean_accounts_stats
             .clean_old_root_us
             .fetch_add(clean_rooted.as_us(), Ordering::Relaxed);
-        reclaims
     }
 
     /// Reclaim older states of accounts older than max_clean_root_inclusive for AccountsDb bloat mitigation.
@@ -1091,10 +1088,59 @@ impl AccountsDb {
                         );
                     });
             });
+            // Queue the slots of the reclaims for shrinking if their storage is now worth shrinking
+            self.queue_shrink_candidates(reclaims.iter().map(|((slot, _), _)| *slot));
         });
         self.clean_accounts_stats
             .clean_old_root_reclaim_us
             .fetch_add(reclaim_us, Ordering::Relaxed);
+    }
+
+    /// Deduplicate slots and enqueue any slots that are worth shrinking to the shrinking
+    /// candidate set. Returns the number of slots enqueued
+    fn queue_shrink_candidates(&self, slots: impl IntoIterator<Item = Slot>) -> usize {
+        let candidates = slots
+            .into_iter()
+            .collect::<IntSet<_>>()
+            .into_iter()
+            .filter(|slot| {
+                self.storage
+                    .get_slot_storage_entry(*slot)
+                    .is_some_and(|store| {
+                        self.is_shrinking_productive(&store) && self.is_candidate_for_shrink(&store)
+                    })
+            })
+            .collect::<Vec<_>>();
+        let num_candidates = candidates.len();
+        if !candidates.is_empty() {
+            self.shrink_candidate_slots
+                .lock()
+                .unwrap()
+                .extend(candidates);
+        }
+        num_candidates
+    }
+
+    /// Queue every slot whose storage is worth shrinking. Returns the number of slots enqueued
+    fn queue_shrink_candidates_for_all_slots(&self) -> usize {
+        self.queue_shrink_candidates(self.storage.all_slots())
+    }
+
+    /// Startup work that does not have to block index generation. Called once, when the
+    /// validator starts its background services
+    pub fn finish_startup(&self) {
+        // The storages loaded from the snapshot have never been considered for shrinking
+        let (num_shrink_candidates, queue_shrink_candidates_us) =
+            measure_us!(self.queue_shrink_candidates_for_all_slots());
+        datapoint_info!(
+            "accounts_db_finish_startup",
+            (
+                "queue_shrink_candidates_us",
+                queue_shrink_candidates_us,
+                i64
+            ),
+            ("num_shrink_candidates", num_shrink_candidates, i64),
+        );
     }
 
     /// Purges each key in `removed_keys` from the enabled secondary indexes, unless the key is
@@ -1524,6 +1570,12 @@ impl AccountsDb {
                 // Take the bin so its allocation is freed by this thread once the bin is
                 // scanned, rather than serially after every bin completes.
                 let candidates_bin = mem::take(&mut *candidates_bin.write().unwrap());
+
+                // Sized for one reclaim per candidate. During startup this should be fairly
+                // accurate, but during normal operation, resizes will likely be needed
+                let mut reclaims_local =
+                    ReclaimsWithNewestSlot::with_capacity(candidates_bin.len());
+
                 for candidate_pubkey in candidates_bin {
                     let mut should_collect_reclaims = false;
                     self.accounts_index.scan(
@@ -1584,12 +1636,15 @@ impl AccountsDb {
                         ScanFilter::All,
                     );
                     if should_collect_reclaims {
-                        let reclaims_new =
-                            self.collect_reclaims(&candidate_pubkey, max_clean_root_inclusive);
-                        if !reclaims_new.is_empty() {
-                            reclaims.lock().unwrap().extend(reclaims_new);
-                        }
+                        self.collect_reclaims(
+                            &candidate_pubkey,
+                            max_clean_root_inclusive,
+                            &mut reclaims_local,
+                        );
                     }
+                }
+                if !reclaims_local.is_empty() {
+                    reclaims.lock().unwrap().append(&mut reclaims_local);
                 }
                 found_not_zero_accum.fetch_add(found_not_zero, Ordering::Relaxed);
                 not_found_on_fork_accum.fetch_add(not_found_on_fork, Ordering::Relaxed);
@@ -1602,10 +1657,12 @@ impl AccountsDb {
             .active_stats
             .activate(ActiveStatItem::CleanScanCandidates);
         let mut accounts_scan = Measure::start("accounts_scan");
-        if is_startup {
-            do_clean_scan();
-        } else {
-            self.thread_pool_background.install(do_clean_scan);
+        if num_candidates > 0 {
+            if is_startup {
+                do_clean_scan();
+            } else {
+                self.thread_pool_background.install(do_clean_scan);
+            }
         }
         accounts_scan.stop();
         drop(active_guard);
@@ -1708,13 +1765,6 @@ impl AccountsDb {
                 "remove_dead_accounts_remove_us",
                 self.clean_accounts_stats
                     .remove_dead_accounts_remove_us
-                    .swap(0, Ordering::Relaxed),
-                i64
-            ),
-            (
-                "remove_dead_accounts_shrink_us",
-                self.clean_accounts_stats
-                    .remove_dead_accounts_shrink_us
                     .swap(0, Ordering::Relaxed),
                 i64
             ),
@@ -2111,7 +2161,7 @@ impl AccountsDb {
         let accounts = [(slot, &shrink_collect.alive_accounts.alive_accounts()[..])];
         let storable_accounts = StorableAccountsBySlot::new(slot, &accounts, self);
         stats_sub.store_accounts_stats =
-            self.store_accounts_for_shrink(storable_accounts, shrink_in_progress.new_storage());
+            self.store_accounts_for_shrink(&storable_accounts, shrink_in_progress.new_storage());
 
         let tombstone_refs: Vec<_> = shrink_collect.tombstones_to_carry_forward.iter().collect();
         let tombstone_accounts = [(slot, &tombstone_refs[..])];
@@ -2181,7 +2231,9 @@ impl AccountsDb {
         if let Some(storage) = self
             .storage
             .get_slot_storage_entry_shrinking_in_progress_ok(slot)
-            && let Some(new_storage) = storage.reopen_as_readonly()
+            && let Some(new_storage) = storage
+                .reopen_as_readonly()
+                .expect("reopen storage as readonly")
         {
             // consider here the race condition of tx processing having looked up something in the index,
             // which could return (slot, append vec id). We want the lookup for the storage to get a storage
@@ -2204,24 +2256,6 @@ impl AccountsDb {
         let shrunken_store = Arc::new(self.create_store(slot, size));
         self.storage
             .shrinking_in_progress(slot, old_store, shrunken_store)
-    }
-
-    // Reads all accounts in given slot's AppendVecs and filter only to alive,
-    // then create a minimum AppendVec filled with the alive.
-    fn shrink_slot_forced(&self, slot: Slot) {
-        debug!("shrink_slot_forced: slot: {slot}");
-
-        if let Some(store) = self
-            .storage
-            .get_slot_storage_entry_shrinking_in_progress_ok(slot)
-            && self.is_shrinking_productive(&store)
-        {
-            self.shrink_storage(store)
-        }
-    }
-
-    fn all_slots_in_storage(&self) -> Vec<Slot> {
-        self.storage.all_slots()
     }
 
     /// Given the input `ShrinkCandidates`, this function sorts the stores by their alive ratio
@@ -2448,41 +2482,6 @@ impl AccountsDb {
         );
 
         num_selected
-    }
-
-    /// This is only called at startup from bank when we are being extra careful such as when we downloaded a snapshot.
-    /// Also called from tests.
-    /// `newest_slot_skip_shrink_inclusive` is used to avoid shrinking the slot we are loading a snapshot from. If we shrink that slot, we affect
-    /// the bank hash calculation verification at startup.
-    pub fn shrink_all_slots(
-        &self,
-        is_startup: bool,
-        newest_slot_skip_shrink_inclusive: Option<Slot>,
-    ) {
-        let _guard = self.active_stats.activate(ActiveStatItem::Shrink);
-        const OUTER_CHUNK_SIZE: usize = 2000;
-        let mut slots = self.all_slots_in_storage();
-        if let Some(newest_slot_skip_shrink_inclusive) = newest_slot_skip_shrink_inclusive {
-            // at startup, we cannot shrink the slot that we're about to replay and recalculate bank hash for.
-            // That storage's contents are used to verify the bank hash (and accounts delta hash) of the startup slot.
-            slots.retain(|slot| slot < &newest_slot_skip_shrink_inclusive);
-        }
-
-        if is_startup {
-            let threads = num_cpus::get();
-            let inner_chunk_size = std::cmp::max(OUTER_CHUNK_SIZE / threads, 1);
-            slots.chunks(OUTER_CHUNK_SIZE).for_each(|chunk| {
-                chunk.par_chunks(inner_chunk_size).for_each(|slots| {
-                    for slot in slots {
-                        self.shrink_slot_forced(*slot);
-                    }
-                });
-            });
-        } else {
-            for slot in slots {
-                self.shrink_slot_forced(slot);
-            }
-        }
     }
 
     /// Scans all accounts visible from `ancestors`, invoking `scan_func` for each.
@@ -3557,6 +3556,11 @@ impl AccountsDb {
                 flush_stats.store_accounts_total_us.0,
                 i64
             ),
+            (
+                "flush_read_cache_us",
+                flush_stats.flush_read_cache_us.0,
+                i64
+            ),
             ("write_accounts_us", flush_stats.write_accounts_us.0, i64),
             ("update_index_us", flush_stats.update_index_us.0, i64),
             ("handle_reclaims_us", flush_stats.handle_reclaims_us.0, i64),
@@ -4243,7 +4247,6 @@ impl AccountsDb {
         assert!(self.storage.no_shrink_in_progress());
 
         let mut dead_slots = IntSet::default();
-        let mut new_shrink_candidates = ShrinkCandidates::default();
         let mut measure = Measure::start("remove");
         for (slot, account_info) in reclaims {
             reclaimed_offsets
@@ -4284,7 +4287,9 @@ impl AccountsDb {
                         let mut offsets = offsets.iter().cloned().collect::<Vec<_>>();
                         // sort so offsets are in order. This improves efficiency of loading the accounts.
                         offsets.sort_unstable();
-                        let data_lens = store.accounts.get_account_data_lens(&offsets);
+                        let data_lens = store
+                            .accounts
+                            .get_account_data_lens(offsets.iter().copied());
                         let dead_bytes = data_lens
                             .iter()
                             .map(|len| store.accounts.calculate_stored_size(*len))
@@ -4322,31 +4327,12 @@ impl AccountsDb {
                     // Every remaining account is a tombstone and the slot is older than
                     // the latest full snapshot slot, safe to remove
                     dead_slots.insert(slot);
-                } else if self.is_shrinking_productive(&store)
-                    && self.is_candidate_for_shrink(&store)
-                {
-                    // Checking that this single storage entry is ready for shrinking,
-                    // should be a sufficient indication that the slot is ready to be shrunk
-                    // because slots should only have one storage entry, namely the one that was
-                    // created by `flush_slot_cache()`.
-                    new_shrink_candidates.insert(slot);
                 }
             }
         });
         measure.stop();
         self.clean_accounts_stats
             .remove_dead_accounts_remove_us
-            .fetch_add(measure.as_us(), Ordering::Relaxed);
-
-        let mut measure = Measure::start("shrink");
-        let mut shrink_candidate_slots = self.shrink_candidate_slots.lock().unwrap();
-        for slot in new_shrink_candidates {
-            shrink_candidate_slots.insert(slot);
-        }
-        drop(shrink_candidate_slots);
-        measure.stop();
-        self.clean_accounts_stats
-            .remove_dead_accounts_shrink_us
             .fetch_add(measure.as_us(), Ordering::Relaxed);
 
         dead_slots
@@ -4418,24 +4404,17 @@ impl AccountsDb {
         accounts: impl StorableAccounts<'a>,
         storage: &AccountStorageEntry,
     ) -> StoreAccountsForSquashStats {
-        let slot = accounts.target_slot();
+        let store_accounts_for_shrink_stats = self.store_accounts_for_shrink(&accounts, storage);
 
-        // Flush the read cache if necessary
-        let flush_read_cache_us = if self.read_only_accounts_cache.can_slot_be_in_cache(slot) {
-            let flush_read_cache_time = Measure::start("flush_read_cache");
-            (0..accounts.len()).for_each(|index| {
-                // Based on the patterns of how a validator writes accounts, it is almost always
-                // the case that there is no read only cache entry for this pubkey and slot.
-                // So, we can give that hint to the `remove` for performance.
-                self.read_only_accounts_cache
-                    .remove_assume_not_present(accounts.pubkey(index));
-            });
-            flush_read_cache_time.end_as_us()
-        } else {
-            0
-        };
+        // Drop the read cache entry for every account moved, after the index update for the
+        // same reason as in `store_accounts_for_flush`.
+        let flush_read_cache_time = Measure::start("flush_read_cache");
+        (0..accounts.len()).for_each(|index| {
+            self.read_only_accounts_cache
+                .remove_assume_not_present(accounts.pubkey(index));
+        });
+        let flush_read_cache_us = flush_read_cache_time.end_as_us();
 
-        let store_accounts_for_shrink_stats = self.store_accounts_for_shrink(accounts, storage);
         StoreAccountsForSquashStats {
             store_accounts_for_shrink_stats,
             flush_read_cache_us,
@@ -4449,7 +4428,7 @@ impl AccountsDb {
     ///   accounts are decremented for the older storage or that the old storage is removed entirely
     pub fn store_accounts_for_shrink<'a>(
         &self,
-        accounts: impl StorableAccounts<'a>,
+        accounts: &impl StorableAccounts<'a>,
         storage: &AccountStorageEntry,
     ) -> StoreAccountsForShrinkStats {
         let slot = accounts.target_slot();
@@ -4457,11 +4436,11 @@ impl AccountsDb {
 
         // Write the accounts to storage
         let write_accounts_time = Measure::start("write_accounts");
-        let infos = self.write_accounts_to_storage(slot, storage, &accounts);
+        let infos = self.write_accounts_to_storage(slot, storage, accounts);
         let write_accounts_us = write_accounts_time.end_as_us();
 
         let update_index_time = Measure::start("update_index");
-        self.update_index_for_shrink(&infos, &accounts);
+        self.update_index_for_shrink(&infos, accounts);
         let update_index_us = update_index_time.end_as_us();
 
         StoreAccountsForShrinkStats {
@@ -4518,6 +4497,15 @@ impl AccountsDb {
         let reclaims = self.update_index_for_flush(&infos, &accounts, reclaim_handling);
         let update_index_us = update_index_time.end_as_us();
 
+        // Drop the read cache entry for every account written to storage. The read cached version
+        // stale as it was superseded by the new version in storage
+        let flush_read_cache_time = Measure::start("flush_read_cache");
+        (0..accounts.len()).for_each(|index| {
+            self.read_only_accounts_cache
+                .remove_assume_not_present(accounts.pubkey(index));
+        });
+        let flush_read_cache_us = flush_read_cache_time.end_as_us();
+
         // If there are any reclaims then they should be handled. Reclaims affect
         // all storages, and may result in the removal of dead storages.
         let handle_reclaims_time = Measure::start("handle_reclaims");
@@ -4532,6 +4520,9 @@ impl AccountsDb {
                 reclaims.iter(),
                 &purge_stats,
                 MarkAccountsObsolete::Yes(slot),
+            );
+            self.queue_shrink_candidates(
+                reclaims.iter().map(|(reclaimed_slot, _)| *reclaimed_slot),
             );
             is_slot_dead = dead_slots.contains(&slot);
             num_obsolete_slots_removed =
@@ -4551,6 +4542,7 @@ impl AccountsDb {
         }
 
         StoreAccountsForFlushStats {
+            flush_read_cache_us,
             write_accounts_us,
             update_index_us,
             handle_reclaims_us,

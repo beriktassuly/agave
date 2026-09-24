@@ -91,7 +91,6 @@ pub(crate) struct ReadOnlyAccountsCache {
 
     // Performance statistics
     stats: Arc<AtomicReadOnlyCacheStats>,
-    highest_slot_stored: AtomicU64,
 
     /// Timer for generating timestamps for entries.
     timer: Instant,
@@ -143,7 +142,6 @@ impl ReadOnlyAccountsCache {
         );
 
         Self {
-            highest_slot_stored: AtomicU64::default(),
             _max_data_size_lo: max_data_size_lo,
             _max_data_size_hi: max_data_size_hi,
             cache,
@@ -199,7 +197,6 @@ impl ReadOnlyAccountsCache {
         timestamp: u64,
     ) {
         let measure_store = Measure::start("");
-        self.highest_slot_stored.fetch_max(slot, Ordering::Release);
         let new_account_size = Self::account_size(&account);
         let old_account_size;
         match self.cache.entry(pubkey) {
@@ -219,11 +216,6 @@ impl ReadOnlyAccountsCache {
         update_stat(&self.data_size, old_account_size, new_account_size);
         let store_us = measure_store.end_as_us();
         self.stats.store_us.fetch_add(store_us, Ordering::Relaxed);
-    }
-
-    /// true if any pubkeys could have ever been stored into the cache at `slot`
-    pub(crate) fn can_slot_be_in_cache(&self, slot: Slot) -> bool {
-        self.highest_slot_stored.load(Ordering::Acquire) >= slot
     }
 
     /// remove entry if it exists.
